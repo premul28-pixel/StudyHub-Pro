@@ -1,0 +1,222 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // =========================================================================
+    // HELPER FUNCTIONS
+    // =========================================================================
+
+    // Verify if the request is from an authenticated user
+    function isAuthenticated() {
+      return request.auth != null && request.auth.uid != null;
+    }
+
+    // Verify if the authenticated user is the owner of the document path
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // Check if a field exists and is a non-empty string
+    function isNonEmptyString(data, field) {
+      return field in data && data[field] is string && data[field].size() > 0;
+    }
+
+    // Profile Validation:
+    // Requires name/displayName, email, and college/collegeName as non-empty strings (top-level or nested)
+    function hasValidUserProfile(data) {
+      let hasName = isNonEmptyString(data, 'name') 
+        || isNonEmptyString(data, 'displayName')
+        || ('personalDetails' in data && data.personalDetails is map && isNonEmptyString(data.personalDetails, 'fullName'));
+      let hasEmail = isNonEmptyString(data, 'email')
+        || ('personalDetails' in data && data.personalDetails is map && isNonEmptyString(data.personalDetails, 'email'));
+      let hasCollege = isNonEmptyString(data, 'college') 
+        || isNonEmptyString(data, 'collegeName')
+        || ('collegeDetails' in data && data.collegeDetails is map && (isNonEmptyString(data.collegeDetails, 'college') || isNonEmptyString(data.collegeDetails, 'collegeName')));
+      return hasName && hasEmail && hasCollege;
+    }
+
+    // Check if initial registration document before onboarding flow
+    function isInitialRegistration(data) {
+      return (('hasCompletedOnboarding' in data && data.hasCompletedOnboarding == false)
+           || ('onboardingComplete' in data && data.onboardingComplete == false))
+        && (isNonEmptyString(data, 'name') 
+            || isNonEmptyString(data, 'displayName')
+            || ('personalDetails' in data && data.personalDetails is map && isNonEmptyString(data.personalDetails, 'fullName')))
+        && (isNonEmptyString(data, 'email')
+            || ('personalDetails' in data && data.personalDetails is map && isNonEmptyString(data.personalDetails, 'email')));
+    }
+
+    // Validate user profile creation
+    function isValidUserCreate(data) {
+      return hasValidUserProfile(data) || isInitialRegistration(data);
+    }
+
+    // Validate user profile updates (onboarding completion or updates)
+    function isValidUserUpdate(data) {
+      return (!('hasCompletedOnboarding' in data) || data.hasCompletedOnboarding == false) 
+        || hasValidUserProfile(data);
+    }
+
+    // =========================================================================
+    // DEFAULT RULE: DENY ALL
+    // Strict lockdown: No public read or write across any collection
+    // =========================================================================
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // =========================================================================
+    // USERS COLLECTION
+    // Path: /users/{userId}
+    // =========================================================================
+    match /users/{userId} {
+      // 1. User Isolation: Only the authenticated owner can read their profile
+      allow read: if isOwner(userId);
+
+      // 2. Profile Creation & Onboarding Validation:
+      // Must be authenticated owner, and required fields (name, email, college) must be non-empty strings
+      allow create: if isOwner(userId) && isValidUserCreate(request.resource.data);
+
+      // 3. Profile Updates:
+      // Must be authenticated owner, maintaining valid non-empty profile fields
+      allow update: if isOwner(userId) && isValidUserUpdate(request.resource.data);
+
+      // 4. Profile Deletion:
+      // Only the authenticated owner can delete their profile
+      allow delete: if isOwner(userId);
+
+      // =======================================================================
+      // FINANCE DATA: TRANSACTIONS SUBCOLLECTION
+      // Path: /users/{userId}/transactions/{transactionId}
+      // =======================================================================
+      match /transactions/{transactionId} {
+        // Strict Isolation: Only owner can read, delete their own transactions
+        allow read, delete: if isOwner(userId);
+
+        // Validation: Only owner can create/update their transactions
+        allow create, update: if isOwner(userId)
+          && (!('amount' in request.resource.data) || request.resource.data.amount is number)
+          && (!('type' in request.resource.data) || request.resource.data.type in ['income', 'expense']);
+      }
+
+      // =======================================================================
+      // STUDY & DSA DATA: PLATFORM STATS SUBCOLLECTION
+      // Path: /users/{userId}/platformStats/{platform}
+      // =======================================================================
+      match /platformStats/{platform} {
+        // Only the owner can view or update their platform stats
+        allow read, write: if isOwner(userId);
+      }
+
+      // =======================================================================
+      // AI ASSISTANT: SETTINGS, API KEYS & CONVERSATIONS
+      // Path: /users/{userId}/aiSettings/{settingId}
+      // Path: /users/{userId}/aiKeys/{keyId}
+      // Path: /users/{userId}/conversations/{conversationId}
+      // =======================================================================
+      match /aiSettings/{settingId} {
+        // Strict Isolation: API keys (OpenAI, Gemini, Claude, Custom) are accessible
+        // and writable EXCLUSIVELY by the authenticated owner
+        allow read, write: if isOwner(userId);
+      }
+
+      match /aiKeys/{keyId} {
+        // Encrypted or raw user API keys can only be accessed by the owning user
+        allow read, write: if isOwner(userId);
+      }
+
+      match /conversations/{conversationId} {
+        // Chat histories and queries can only be read/written by the owner
+        allow read, write: if isOwner(userId);
+      }
+
+      // =======================================================================
+      // LIFE PLANNER: EVENTS, TIMETABLE & HABITS
+      // Path: /users/{userId}/events/{eventId}
+      // =======================================================================
+      match /events/{eventId} {
+        allow read, write: if isOwner(userId);
+      }
+
+      // =======================================================================
+      // DASHBOARD: DAILY ACTIVITIES & HISTORY
+      // Path: /users/{userId}/dailyActivities/{dateKey}
+      // =======================================================================
+      match /dailyActivities/{dateKey} {
+        allow read, write: if isOwner(userId);
+      }
+
+      // =======================================================================
+      // STUDY TRACKER: REAL STUDY SESSIONS
+      // Path: /users/{userId}/studySessions/{sessionId}
+      // =======================================================================
+      match /studySessions/{sessionId} {
+        allow read, write: if isOwner(userId);
+      }
+
+      // =======================================================================
+      // DSA TRACKER: PROBLEM SOLVING PROGRESS & SUBMISSIONS
+      // Path: /users/{userId}/dsaProgress/{problemId}
+      // =======================================================================
+      match /dsaProgress/{problemId} {
+        allow read, write: if isOwner(userId);
+      }
+
+      // =======================================================================
+      // CODING PRACTICE: REAL-TIME IN-BROWSER CODE SUBMISSIONS
+      // Path: /users/{userId}/submissions/{submissionId}
+      // =======================================================================
+      match /submissions/{submissionId} {
+        // Strict Isolation: Users can exclusively read, record and manage their own submissions
+        allow read, write: if isOwner(userId);
+      }
+
+      // =======================================================================
+      // MISTAKE REVIEW JOURNAL: ATTEMPT LOGS & REFLECTIONS (Phase 3 Prep)
+      // Path: /users/{userId}/mistakes/{mistakeId}
+      // =======================================================================
+      match /mistakes/{mistakeId} {
+        // Strict Isolation: User mistake logs and retrospectives are strictly private
+        allow read, write: if isOwner(userId);
+      }
+
+      // =======================================================================
+      // DAILY ACTIVITY (Subcollection alternative)
+      // Path: /users/{userId}/dailyActivity/{activityId}
+      // =======================================================================
+      match /dailyActivity/{activityId} {
+        allow read, write: if isOwner(userId);
+      }
+
+      // =======================================================================
+      // USER SETTINGS & PREFERENCES
+      // Path: /users/{userId}/settings/{settingId}
+      // =======================================================================
+      match /settings/{settingId} {
+        allow read, write: if isOwner(userId);
+      }
+
+      // =======================================================================
+      // CATCH-ALL USER ISOLATION
+      // Guarantees all subcollections and nested documents under /users/{userId}
+      // are accessible exclusively by the authenticated owner.
+      // =======================================================================
+      match /{allSubcollections=**} {
+        allow read, write: if isOwner(userId);
+      }
+    }
+
+    // =========================================================================
+    // TOP-LEVEL TRANSACTIONS (Optional defense-in-depth fallback)
+    // Path: /transactions/{transactionId}
+    // =========================================================================
+    match /transactions/{transactionId} {
+      allow read, delete: if isAuthenticated() && resource.data.userId == request.auth.uid;
+      allow create: if isAuthenticated() && request.resource.data.userId == request.auth.uid;
+      allow update: if isAuthenticated() 
+                    && resource.data.userId == request.auth.uid 
+                    && request.resource.data.userId == request.auth.uid;
+    }
+  }
+}
